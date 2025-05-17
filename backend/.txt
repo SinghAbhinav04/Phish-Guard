@@ -1,0 +1,328 @@
+
+const FeedbackSchema = new mongoose.Schema({
+    url: { type: String, required: true },
+    userFeedback: { type: String, required: false },
+    type:{type:String , enum: ['phishing', 'safe'] , required:true},
+    verified: { type: Boolean, default: false }, 
+    createdAt: { type: Date, default: Date.now }
+  });
+  
+  
+
+
+const DatasetSchema = new mongoose.Schema({
+  url: { type: String, required: true, unique: true },
+  features: { type: [Number], required: true }, 
+  prediction: { type: String, required: true }, 
+  createdAt: { type: Date, default: Date.now }
+});
+
+app.use("/api/scan",scanRouter)
+app.use("/api/history",historyRouter)
+app.use("/api/feedback",feedbackRouter)
+
+scanRouter.post("/",handleScanPost)
+historyRouter.get("/",getHistory)
+feedbackRouter.post("/",handlePostFeedback)
+
+const Dataset = require("../models/Dataset");
+const axios = require("axios");
+
+async function handleScanPost(req, res) {
+  console.log("Req")
+  const { url } = req.body;
+  console.log(url)
+  if (!url) return res.status(400).json({ error: "URL is required" });
+
+  try {
+    const existing = await Dataset.findOne({ url });
+
+    if (existing) {
+      return res.json({ result: existing.prediction, fromCache: true });
+    }
+
+    const flaskResponse = await axios.post("http://localhost:5001/predict", { url });
+    console.log(flaskResponse.data)
+    const { features, prediction } = flaskResponse.data;
+
+    const featuresArray = Object.values(features);
+
+    const newScan = new Dataset({ url, features: featuresArray, prediction });
+    await newScan.save();
+
+    res.json({ result: prediction, fromCache: false });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Scan failed" });
+  }
+}
+
+module.exports = { handleScanPost };
+
+const Feedback = require("../models/Feedback.js")
+const Dataset = require("../models/Dataset.js")
+const verifyUrl = require("../services/geminiResponse.js")
+const axios = require("axios")
+
+async function handlePostFeedback(req, res){
+    try{
+        const {url, userFeedback , type} = req.body;
+        if(!url){
+            return res.status(400).json({error:"URL is required"})
+        }
+
+        const feedback = new Feedback({url , userFeedback , type})
+        await feedback.save()
+
+        const flaskResponse = await axios.post("http://localhost:5001/predict", { url });
+        const { features, prediction } = flaskResponse.data;
+        const featuresArray = Object.values(features);
+
+        const geminiResponse = await verifyUrl(url,prediction);
+        console.log(geminiResponse)
+
+        const existingDataset = await Dataset.findOne({url:url})
+        if(existingDataset){
+            await Dataset.updateOne({url:url}, {$set:{features:featuresArray, prediction:geminiResponse}})
+        }else{
+            const dataset = new Dataset({url ,features:featuresArray, prediction:geminiResponse})
+            await dataset.save()
+        }
+
+        if(geminiResponse != prediction){
+            const updatedResponse = await axios.post("http://localhost:5001/update-dataset", { url, geminiResponse });
+            console.log(updatedResponse)
+        }
+
+
+        return res.json({prediction:prediction})
+
+    }catch(err){
+        console.log(err)
+        return res.status(500).json({error:"Server side error"})
+    }
+}
+
+async function handleDeepScan(req , res){
+    try{
+        const {url, type} = req.body(url,type)
+
+        if(!url || !type){
+            return res.status(400).json({message:"URL/type is Required"})
+        }
+
+        const prediction = await axios.post("http://localhost:5001/deepscan", {url , type})
+        
+
+    }catch(err){
+        console.log(err)
+        return res.status(500).json({error:"Server side error"})
+    }
+}
+
+module.exports = {handlePostFeedback}
+
+const Dataset = require("../models/Dataset.js")
+
+async function getHistory(req , res){
+        try {
+          const data = await Dataset.find().sort({ createdAt: -1 }).limit(10);
+          res.json(data);
+        } catch (err) {
+          console.error(err);
+          res.status(500).json({ error: 'Could not fetch history' });
+        }
+}
+
+module.exports = { getHistory }
+
+
+from flask import Flask, request, jsonify
+import joblib
+from utils.feature_extractor import extract_features
+from utils.retrain import retrain
+
+app = Flask(__name__)
+model = joblib.load("model/phishing_model.pkl")
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    data = request.get_json()
+    url = data.get("url")
+
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+
+    feature_df = extract_features(url)
+    prediction = model.predict(feature_df.values)[0]
+    print(prediction)
+    
+    prediction_string = "phising" if prediction == 1 else "safe"
+
+    if prediction ==1:
+        retrain(feature_df, prediction)
+    feature_dict = feature_df.to_dict(orient='records')[0]
+
+    return jsonify({
+        "features": feature_dict,
+        "prediction": prediction_string  
+    })
+
+@app.route("/update-dataset", methods=["POST"])
+def update_dataset():
+    data = request.get_json()
+    url = data.get("url")
+    prediction = data.get("geminiResponse")
+    if not url or prediction is None:
+        return jsonify({"error": "URL and prediction are required"}), 400
+    feature_df = extract_features(url)
+    retrain(feature_df, prediction)
+    return jsonify({"message": "Dataset updated successfully"}), 200
+
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001)
+
+
+
+import pandas as pd 
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+
+
+
+def train_model():
+    data = pd.read_csv("./ML/dataset/Dataset.csv")
+    print(data.tail())
+    y= data["Type"]
+    X = data.drop(columns=["Type"])
+
+    rfc = RandomForestClassifier(random_state=42)
+    rfc.fit(X,y)
+
+    joblib.dump(rfc,"./model/phishing_model.pkl")
+
+import pandas as pd
+from script import train_model
+
+count = 0
+
+def retrain(features_df, prediction):
+    global count
+    count += 1
+
+    # Add "Type" column and move it to the front
+    features_df["Type"] = prediction
+    columns = ["Type"] + [col for col in features_df.columns if col != "Type"]
+    features_df = features_df[columns]
+
+    # Load the existing dataset
+    df = pd.read_csv("/Users/abhinavsingh/Desktop/Ip/flask-backend/ML/dataset/Dataset.csv")
+
+    # Ensure column order matches existing dataset
+    features_df = features_df[df.columns]
+
+    # Append and save
+    updated_df = pd.concat([df, features_df], ignore_index=True)
+    updated_df.to_csv("/Users/abhinavsingh/Desktop/Ip/flask-backend/ML/dataset/Dataset.csv", index=False)
+
+    # Retrain every 10 samples
+    if count % 10 == 0:
+        train_model()
+
+class Net(nn.Module):
+    def __init__(self, input_dim):
+        super(Net, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+
+    def forward(self, x):
+        return self.model(x)
+
+Accuracy: 0.900262149626941
+
+rfc = RandomForestClassifier(random_state=42)
+rfc.fit(X_train,y_train)
+
+dist_params={
+    "n_estimators":[0,50,100],
+    "max_depth":[5],
+    "min_samples_split":[7],
+    "min_samples_leaf":[7]
+}
+rfr_model = RandomForestRegressor()
+
+rs_rfr = RandomizedSearchCV(
+    estimator=rfr_model,
+    param_distributions=dist_params,
+    n_iter=3,
+    cv=5,
+    random_state=42,
+    n_jobs=-1
+)
+0.9673522887678968
+
+used frontiers URL based data 
+
+import { useState } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import Scan from './components/Scan'
+import History from './components/History'
+import Feedback from './components/Feedback'
+import Settings from './components/Settings'
+import Navigation from './components/Navigation'
+import { useTheme } from './contexts/ThemeContext'
+
+function App() {
+  const [activeTab, setActiveTab] = useState('scan')
+  const { theme } = useTheme()
+  
+  const renderActiveComponent = () => {
+    switch (activeTab) {
+      case 'scan':
+        return <Scan />
+      case 'history':
+        return <History />
+      case 'feedback':
+        return <Feedback />
+      case 'settings':
+        return <Settings />
+      default:
+        return <Scan />
+    }
+  }
+  
+  return (
+    <div className={`h-screen w-full flex flex-col ${theme}`}>
+      <div className="flex-1 overflow-hidden">
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={activeTab}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.2 }}
+            className="h-full"
+          >
+            {renderActiveComponent()}
+          </motion.div>
+        </AnimatePresence>
+      </div>
+      <Navigation activeTab={activeTab} setActiveTab={setActiveTab} />
+    </div>
+  )
+}
+
+export default App
