@@ -89,9 +89,9 @@ The application follows a microservices architecture with the following componen
 ##  Documentation
 
 For detailed information about each component:
-- [Flask Backend Documentation](./flask-backend/FLASK-README.md)
-- [Node.js Backend Documentation](./backend/NODE-README.md)
-- [Frontend Documentation](./extension-ui/FRONTEND-README.md)
+- [Flask Backend Documentation](./flask-backend/README.md)
+- [Node.js Backend Documentation](./backend/README.md)
+- [Frontend Documentation](./extension-ui/README.md)
 
 ##  ML Model Performance
 
